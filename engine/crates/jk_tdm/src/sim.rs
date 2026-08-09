@@ -3320,6 +3320,25 @@ pub struct Fighter {
     /// single discrete impulse, scout-only, the same shape as the second
     /// flip charge above.
     pub scout_air_jump_used: bool,
+    /// §owner AGILE SUPPORT MECH: is the scout currently climbing a wall?
+    ///
+    /// Deliberately a bare bool, not a struct naming which cover object -
+    /// `wall_climb_target` re-queries "is there still climbable wall
+    /// directly ahead" fresh every tick this is true, which is also what
+    /// makes "runs out of surface" work for free: walk off the edge of
+    /// the wall you are climbing and the very next tick's query simply
+    /// finds nothing, and climbing stops on its own. A stored reference
+    /// to a specific `Aabb` would have to be invalidated by hand for the
+    /// same case and could go stale.
+    ///
+    /// TOGGLED by the same context-interact key hull-climbing already
+    /// uses (`cmd.exit_mech`, edge-triggered - see `climbing` a few
+    /// fields up), not held. A true hold-to-climb reading needs a new
+    /// continuously-sampled input field wired in `main.rs`, which is
+    /// contested by another session's work right now; a toggle needs no
+    /// new input at all and matches the UX convention this game already
+    /// uses for the other climb mechanic on the exact same key.
+    pub wall_climbing: bool,
     /// §6: >0 → the raised shield is DIPPED for a throw (blocks nothing).
     pub shield_dip_t: f32,
     /// Ability cooldown (repulsor).
@@ -5522,6 +5541,31 @@ pub const CLIMB_GRIP_RECOVER_PER_S: f32 = 9.0;
 /// A strike landed AT the stripped zone, reachable only by being there.
 /// Stacks ON TOP of angle armor and the exposed-frame x1.25.
 pub const CLIMB_STRIKE_MULT: f32 = 1.6;
+
+// ---- §owner AGILE SUPPORT MECH: wall climbing -----------------------
+// A separate mechanic from the hull-climb just above, sharing nothing
+// but the general shape (attach, drain a resource, detach). This one
+// climbs COVER geometry, not a mech's hull.
+
+/// How close to a wall's footprint the scout must stand to start or
+/// continue climbing it.
+pub const WALL_CLIMB_REACH_M: f32 = 1.4;
+/// A wall shorter than this is something you step up onto, not
+/// something worth a dedicated climb - keeps this mechanic from
+/// triggering on a knee-high crate.
+pub const WALL_CLIMB_MIN_HEIGHT_M: f32 = 2.2;
+/// Fixed vertical rate. Not tied to the scout's own ground speed - a
+/// climb is a different kind of movement, not sprinting turned sideways.
+pub const WALL_CLIMB_SPEED_MPS: f32 = 3.4;
+/// Costs the SAME heat pool the scout's plasma cannon and repair beam
+/// already share (`gatling_heat`), per the owner's own framing - not a
+/// new, separate resource. 13.3 s of continuous climbing (computed:
+/// 1.0 / WALL_CLIMB_HEAT_PER_S) fills it from empty and forces the same
+/// vent lockout firing into it would; roughly a quarter of plasma's own
+/// heat rate (PLASMA_HEAT_PER_SHOT / PLASMA_FIRE_PERIOD ~= 0.33/s), so
+/// a pilot who has just been firing does feel the shared pool without a
+/// short climb alone being able to force a vent on its own.
+pub const WALL_CLIMB_HEAT_PER_S: f32 = 0.075;
 pub const MECH_EXPOSED_DMG_MULT: f32 = 1.25;
 /// Frontal 0–60°: 47.5% reduction (×0.525 through). Side 60–120°: 30%
 /// (×0.70). Rear: none.
@@ -6445,6 +6489,7 @@ impl TdmSim {
                     flip_recover_t: 0.0,
                     scout_second_flip_used: false,
                     scout_air_jump_used: false,
+                    wall_climbing: false,
                     ability_cd: 0.0,
                     last_ability_at: -100.0,
                     last_dmg_at: -100.0,
@@ -7057,6 +7102,11 @@ impl TdmSim {
                     f.flip_used = false;
                     f.scout_second_flip_used = false;
                     f.scout_air_jump_used = false;
+                    // §owner AGILE SUPPORT MECH: a fresh life must not
+                    // spawn already climbing - the same "state survived
+                    // a transition it should not" reasoning as every
+                    // other reset on this list.
+                    f.wall_climbing = false;
                     f.flip_recover_t = 0.0;
                     f.spear_wind_t = 0.0;
                     f.ability_cd = 0.0;
@@ -7810,6 +7860,30 @@ impl TdmSim {
                 f.mech_transition_t = MECH_EXIT_S;
                 f.mech_exiting = true;
             }
+            // §owner AGILE SUPPORT MECH: wall climbing, a FOURTH meaning
+            // for the same context-interact key - and it cannot collide
+            // with the three above it. Branch 2 (attach to a mech) is
+            // gated `!in_mech()`, branch 3 (dismount) is gated
+            // specifically to `RobotSuit`; a piloted scout satisfies
+            // neither, so this is a clean, independent addition, not a
+            // fourth case carved out of the others.
+            //
+            // TOGGLE, not hold - see `wall_climbing`'s own doc comment
+            // for why: a true continuous hold needs a new input sampled
+            // in `main.rs`, which is contested by another session's work
+            // right now, and this key already means "press to start,
+            // press to stop" for the hull-climb case one branch up - the
+            // scout gets the same verb shape it already has elsewhere,
+            // not a new one.
+            if cmd.exit_mech && self.fighters[p].in_scout_mech() {
+                if self.fighters[p].wall_climbing {
+                    self.fighters[p].wall_climbing = false; // voluntary release
+                } else if self.fighters[p].gatling_heat < 1.0
+                    && self.wall_climb_target(p).is_some()
+                {
+                    self.fighters[p].wall_climbing = true;
+                }
+            }
             // §5.3 (Brief VI): the missile pod. HOLD = targeting: a MECH
             // under the reticle (6° cone, ≤250 m, LOS) accrues lock —
             // and the VICTIM is warned from lock start, not launch.
@@ -8505,6 +8579,59 @@ impl TdmSim {
             f.grip_pool = drained;
             if let Some(cs_mut) = f.climbing.as_mut() {
                 cs_mut.grip_stamina = drained;
+            }
+        }
+
+        // ---- §owner AGILE SUPPORT MECH: wall climbing ----------------
+        // Same shape as the hull-climb pass just above - runs for every
+        // fighter, every tick, deterministically, and OVERRIDES whatever
+        // the normal movement/gravity pass already computed for anyone
+        // currently climbing. `wall_climb_target` is re-queried fresh
+        // here rather than trusted from the tick the climb started, so
+        // walking off the edge of the wall you are on stops the climb on
+        // its own the very next tick - see `wall_climbing`'s own doc
+        // comment.
+        for i in 0..self.fighters.len() {
+            if !self.fighters[i].wall_climbing {
+                continue;
+            }
+            // defence in depth: the trigger only ever sets this true for
+            // a scout, but a hull lost mid-climb by some other path
+            // (destroyed, forced out) must not leave the flag stranded
+            // true on a body that is no longer in the chassis that can
+            // act on it.
+            let still_scout = self.fighters[i].in_scout_mech();
+            let heat_out = self.fighters[i].gatling_heat >= 1.0;
+            let target = if self.fighters[i].alive() && still_scout && !heat_out {
+                self.wall_climb_target(i)
+            } else {
+                None
+            };
+            let Some(top) = target else {
+                let f = &mut self.fighters[i];
+                f.wall_climbing = false;
+                // an exhaustion cutoff still vents the shared pool, same
+                // as running the plasma cannon dry would - a clean
+                // finish (reaching the top, below) deliberately does not.
+                if heat_out {
+                    f.gatling_heat = 1.0;
+                    f.gatling_vent_t = PLASMA_VENT_S;
+                }
+                continue;
+            };
+            let f = &mut self.fighters[i];
+            let new_y = (f.pos[1] + WALL_CLIMB_SPEED_MPS * DT).min(top);
+            f.pos[1] = new_y;
+            f.vy = 0.0;
+            f.vel = [0.0, 0.0]; // both hands on the wall - no lateral drift
+            f.gatling_heat = (f.gatling_heat + WALL_CLIMB_HEAT_PER_S * DT).min(1.0);
+            if new_y >= top {
+                // reached the top: the climb is DONE, the pilot is now
+                // standing on solid cover - a clean finish, grounded.
+                f.wall_climbing = false;
+                f.grounded = true;
+            } else {
+                f.grounded = false;
             }
         }
 
@@ -9982,6 +10109,16 @@ impl TdmSim {
             if !f.in_mech() || f.stagger_t > 0.0 {
                 return false;
             }
+            // §owner AGILE SUPPORT MECH: same reasoning the hull-climb
+            // gate states for its own gun-block just below in the
+            // general try_fire path - both hands are occupied holding
+            // the wall. Placed here rather than there because THIS is
+            // the hull mount a wall-climbing scout could otherwise still
+            // fire; the general gate already blocks the carried gun for
+            // anyone piloting any chassis regardless of this flag.
+            if f.wall_climbing {
+                return false;
+            }
             // VENTING is a hard lockout, not a slowdown. A weapon that
             // merely got worse when hot would be one you always hold
             // down; a weapon that stops is one you learn to feather.
@@ -10373,6 +10510,38 @@ impl TdmSim {
                 if d < CLIMB_ATTACH_RANGE_M && best.map_or(true, |(_, _, bd)| d < bd) {
                     best = Some((mi, zone, d));
                 }
+            }
+        }
+        best
+    }
+
+    /// §owner AGILE SUPPORT MECH: is there climbable wall within reach of
+    /// `p` right now? A wall is a `CoverKind::Stone` piece of cover, at
+    /// least `WALL_CLIMB_MIN_HEIGHT_M` tall, whose footprint's nearest
+    /// point is within `WALL_CLIMB_REACH_M` of the fighter - and whose
+    /// top is still ABOVE the fighter, so a scout standing on top of a
+    /// wall it just finished climbing does not re-trigger against the
+    /// same slab. Returns that top's world Y.
+    ///
+    /// Deliberately cheap and re-run every tick rather than cached - see
+    /// `Fighter::wall_climbing`'s own doc comment for why.
+    pub fn wall_climb_target(&self, p: usize) -> Option<f32> {
+        let ppos = self.fighters[p].pos;
+        let mut best: Option<f32> = None;
+        for (aabb, kind) in self.cover.iter().zip(self.cover_kind.iter()) {
+            if *kind != CoverKind::Stone {
+                continue;
+            }
+            let height = aabb.max[1] - aabb.min[1];
+            if height < WALL_CLIMB_MIN_HEIGHT_M || ppos[1] >= aabb.max[1] {
+                continue;
+            }
+            let nx = ppos[0].clamp(aabb.min[0], aabb.max[0]);
+            let nz = ppos[2].clamp(aabb.min[2], aabb.max[2]);
+            let (dx, dz) = (ppos[0] - nx, ppos[2] - nz);
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist < WALL_CLIMB_REACH_M && best.map_or(true, |bt| aabb.max[1] > bt) {
+                best = Some(aabb.max[1]);
             }
         }
         best
@@ -15009,6 +15178,113 @@ mod tests {
             s3.fighters[0].vy < 1.0,
             "an unarmoured player must not get a mid-air jump: vy={}",
             s3.fighters[0].vy
+        );
+    }
+
+    /// §owner AGILE SUPPORT MECH: the scout climbs real stone cover.
+    /// Driven entirely through real `step()` calls with the toggle key
+    /// held, exactly the lesson the plasma cannon's own history on this
+    /// branch teaches - a hand-forced state cannot prove the trigger
+    /// dispatch actually works. Five things proven: the toggle starts a
+    /// climb only near a tall enough stone wall, position rises at
+    /// exactly `WALL_CLIMB_SPEED_MPS`, the shared heat pool actually
+    /// drains, reaching the top ends the climb cleanly and grounded
+    /// (not an exhaustion cutoff), and pressing the toggle again mid-
+    /// climb releases voluntarily without needing to reach the top.
+    #[test]
+    fn the_scout_climbs_a_wall_and_stops_cleanly_at_the_top() {
+        let mut s = range(0x9401);
+        s.cover.clear();
+        s.cover_kind.clear();
+        let wall_top = 6.0_f32;
+        s.cover.push(Aabb { min: [-2.0, 0.0, 4.0], max: [2.0, wall_top, 5.0] });
+        s.cover_kind.push(CoverKind::Stone);
+        s.rebuild_grid();
+        {
+            let f = &mut s.fighters[0];
+            f.armor_set = ArmorSet::ScoutMech;
+            f.hull = SCOUT_HULL;
+            f.mech_weapon = MechWeapon::Plasma;
+            f.pos = [0.0, 0.0, 3.9]; // just inside WALL_CLIMB_REACH_M of the wall's face
+            f.yaw = 0.0;
+            f.grounded = true;
+            f.gatling_heat = 0.0;
+            f.gatling_vent_t = 0.0;
+            f.stagger_t = 0.0;
+        }
+        let toggle = PlayerCmd { exit_mech: true, aim: [0.0, 0.0, 1.0], ..Default::default() };
+        let hold = PlayerCmd { aim: [0.0, 0.0, 1.0], ..Default::default() };
+
+        // press once: the climb must actually start.
+        s.step(toggle.clone());
+        assert!(s.fighters[0].wall_climbing, "the toggle must start the climb near a real wall");
+        let y_after_press = s.fighters[0].pos[1];
+
+        // one more real tick: position must have risen by EXACTLY one
+        // tick's worth of the climb rate, and heat must have drained by
+        // exactly one tick's worth of the climb cost - both checked as
+        // arithmetic, not "it moved".
+        s.step(hold.clone());
+        let rose = s.fighters[0].pos[1] - y_after_press;
+        assert!(
+            (rose - WALL_CLIMB_SPEED_MPS * DT).abs() < 1e-4,
+            "one tick of climbing must rise by WALL_CLIMB_SPEED_MPS*DT: got {rose}"
+        );
+        assert!(
+            (s.fighters[0].gatling_heat - WALL_CLIMB_HEAT_PER_S * DT * 2.0).abs() < 1e-4,
+            "two ticks of climbing must cost 2x WALL_CLIMB_HEAT_PER_S*DT of heat: got {}",
+            s.fighters[0].gatling_heat
+        );
+        assert!(!s.fighters[0].grounded, "mid-climb must not read as grounded");
+
+        // hold it the rest of the way to the top.
+        let mut reached_top = false;
+        for _ in 0..(SIM_HZ as usize * 3) {
+            s.step(hold.clone());
+            if !s.fighters[0].wall_climbing {
+                reached_top = true;
+                break;
+            }
+        }
+        assert!(reached_top, "the climb must end on its own at the top within 3s");
+        assert!(
+            (s.fighters[0].pos[1] - wall_top).abs() < 1e-3,
+            "must stop exactly at the wall's top, not overshoot or undershoot: got {}",
+            s.fighters[0].pos[1]
+        );
+        assert!(s.fighters[0].grounded, "a clean top-out must leave the pilot grounded");
+        assert!(
+            s.fighters[0].gatling_vent_t <= 0.0,
+            "reaching the top is a clean finish, not an exhaustion cutoff - no vent"
+        );
+
+        // voluntary release: press again mid-climb, must stop immediately
+        // without waiting for the top.
+        let mut s2 = range(0x9402);
+        s2.cover.clear();
+        s2.cover_kind.clear();
+        s2.cover.push(Aabb { min: [-2.0, 0.0, 4.0], max: [2.0, 20.0, 5.0] }); // tall enough to never finish
+        s2.cover_kind.push(CoverKind::Stone);
+        s2.rebuild_grid();
+        {
+            let f = &mut s2.fighters[0];
+            f.armor_set = ArmorSet::ScoutMech;
+            f.hull = SCOUT_HULL;
+            f.mech_weapon = MechWeapon::Plasma;
+            f.pos = [0.0, 0.0, 3.9];
+            f.yaw = 0.0;
+            f.grounded = true;
+            f.gatling_heat = 0.0;
+            f.gatling_vent_t = 0.0;
+            f.stagger_t = 0.0;
+        }
+        s2.step(toggle.clone());
+        assert!(s2.fighters[0].wall_climbing, "sanity: the second scenario's climb must start too");
+        s2.step(hold.clone());
+        s2.step(toggle);
+        assert!(
+            !s2.fighters[0].wall_climbing,
+            "pressing the toggle again mid-climb must release voluntarily"
         );
     }
 
