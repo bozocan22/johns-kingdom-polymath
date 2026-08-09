@@ -3011,6 +3011,16 @@ pub struct Fighter {
     /// rapid must not eat the precision timer, and vice versa.
     pub plasma_cd: f32,
     pub plasma_charge_t: f32,
+    /// §owner AGILE SUPPORT MECH: consecutive RAPID plasma shots fired
+    /// without releasing the trigger. Drives the precise-then-loosening
+    /// spread/kick curve in `try_fire_plasma`, and which of the twin
+    /// muzzles a shot leaves from (they alternate). Reset the same way
+    /// the gatling resets `turret_burst_i` - on a fresh press, read from
+    /// `gatling_trigger_t` having decayed to zero - so the two mounts
+    /// share one meaning of "the trigger let go" without sharing a
+    /// field, the same reasoning `mech_weapon`-scoped state elsewhere in
+    /// this struct already follows.
+    pub plasma_shot_i: u32,
     /// §owner AGILE SUPPORT MECH: who the repair beam is currently
     /// mending, or -1. Published so the client can DRAW the beam without
     /// re-deriving the choice - two independent answers to "who is being
@@ -4771,6 +4781,32 @@ pub const PLASMA_SPEED: f32 = 68.0;
 /// until it has run down.
 pub const PLASMA_VENT_S: f32 = 2.0;
 
+/// §owner AGILE SUPPORT MECH: twin revolving muzzles. Which one a shot
+/// leaves from alternates with `plasma_shot_i` - a lateral offset off
+/// the shared muzzle origin's own right-vector, not a second aim point,
+/// so both barrels are always shooting the pilot's real aim.
+pub const PLASMA_CANNON_OFFSET_M: f32 = 0.12;
+/// The rapid mount's first `PLASMA_PRECISE_SHOTS` shots since the
+/// trigger was last pulled fresh are dead-on: zero spread, zero added
+/// kick. Past that window both start climbing with `plasma_shot_i`.
+pub const PLASMA_PRECISE_SHOTS: u32 = 2;
+/// Spread added per shot once past the precise window, radians. Same
+/// order of magnitude as `GATLING_SPREAD_HOT - GATLING_SPREAD_COLD`
+/// spread over its own heat range, so the two mounts feel like they
+/// belong to the same family of weapon rather than two unrelated curves.
+pub const PLASMA_SPREAD_PER_SHOT: f32 = 0.012;
+/// Spread ramp ceiling - it worsens with sustained fire, it does not
+/// become unaimable.
+pub const PLASMA_SPREAD_MAX: f32 = 0.070;
+/// Kick ramp per shot past the precise window, as a MULTIPLIER on the
+/// mount's own base kick (`mech_mount_kick(PLASMA_DAMAGE)`) - derived the
+/// same way the gatling's and autocannon's own kicks are, rather than a
+/// second hand-set number that can drift from the family the base kick
+/// already belongs to.
+pub const PLASMA_KICK_RAMP_PER_SHOT: f32 = 0.35;
+/// Kick ramp ceiling, same multiplier units as above.
+pub const PLASMA_KICK_RAMP_MAX: f32 = 2.2;
+
 /// REPAIR BEAM: the secondary, and the reason this chassis exists.
 pub const REPAIR_RANGE_M: f32 = 26.0;
 /// Hull per second put into the target. Slower than a rifle removes it,
@@ -6317,6 +6353,7 @@ impl TdmSim {
                     suppress_from: [0.0, 0.0, 0.0],
                     plasma_cd: 0.0,
                     plasma_charge_t: 0.0,
+                    plasma_shot_i: 0,
                     repair_target: -1,
                     fear: 0.0,
                     routing: false,
@@ -6957,6 +6994,11 @@ impl TdmSim {
                     f.turret_mode = TurretMode::Auto;
                     f.turret_burst_i = 0;
                     f.turret_recover_t = 0.0;
+                    // §owner AGILE SUPPORT MECH: same reasoning as
+                    // turret_burst_i just above - a shot counter that
+                    // survived into a fresh chassis would hand its first
+                    // press spread and kick it never earned.
+                    f.plasma_shot_i = 0;
                     f.gatling_heat = 0.0;
                     f.gatling_vent_t = 0.0;
                     f.gatling_cd = 0.0;
@@ -9899,6 +9941,12 @@ impl TdmSim {
     /// is the honest model - and it is what makes the repair beam cost
     /// something, since both draw from it.
     pub fn try_fire_plasma(&mut self, p: usize, aim: [f32; 3]) -> bool {
+        // §owner AGILE SUPPORT MECH: same "is this a fresh press" read the
+        // gatling opens with, read BEFORE anything below overwrites
+        // `gatling_trigger_t` - a held trigger keeps `plasma_shot_i`
+        // climbing across shots; letting go and pulling again starts the
+        // precise window over.
+        let fresh_press = self.fighters[p].gatling_trigger_t <= 0.0;
         {
             let f = &self.fighters[p];
             if !f.in_mech() || f.stagger_t > 0.0 {
@@ -9911,8 +9959,37 @@ impl TdmSim {
                 return false;
             }
         }
-        let o = self.muzzle_origin(p);
-        let d = normalize(aim);
+        if fresh_press {
+            self.fighters[p].plasma_shot_i = 0;
+        }
+        let shot_i = self.fighters[p].plasma_shot_i;
+        // §owner AGILE SUPPORT MECH: the precise-then-loosening curve.
+        // Zero for the first PLASMA_PRECISE_SHOTS, then both the spread
+        // cone and the felt kick climb together with every shot past it -
+        // one shot count driving both, so "it looks less accurate" and
+        // "it feels less controlled" can never read as two different
+        // weapons disagreeing with each other.
+        let ramp_shots = shot_i.saturating_sub(PLASMA_PRECISE_SHOTS) as f32;
+        let spread = (ramp_shots * PLASMA_SPREAD_PER_SHOT).min(PLASMA_SPREAD_MAX);
+        let kick_mult = 1.0 + (ramp_shots * PLASMA_KICK_RAMP_PER_SHOT).min(PLASMA_KICK_RAMP_MAX);
+        let (ex, ey) = (self.rng.range(-spread, spread), self.rng.range(-spread, spread));
+        let d = perturb(normalize(aim), ex, ey);
+        // §owner AGILE SUPPORT MECH: the twin revolving muzzles. Shot
+        // parity picks left or right off the SAME muzzle_origin the
+        // gatling and the precision shot both use, so the pilot's real
+        // firing point moves with them rather than a second, hand-kept
+        // copy of it.
+        let o = {
+            let base = self.muzzle_origin(p);
+            let yaw = self.fighters[p].yaw;
+            let right = [-yaw.cos(), 0.0, yaw.sin()];
+            let side = if shot_i % 2 == 0 { 1.0 } else { -1.0 };
+            [
+                base[0] + right[0] * PLASMA_CANNON_OFFSET_M * side,
+                base[1],
+                base[2] + right[2] * PLASMA_CANNON_OFFSET_M * side,
+            ]
+        };
         let team = self.fighters[p].team;
         self.next_missile_id += 1;
         let id = self.next_missile_id;
@@ -9942,6 +10019,12 @@ impl TdmSim {
             f.gatling_heat = 1.0;
             f.gatling_vent_t = PLASMA_VENT_S;
         }
+        // §13-style kick, same channel and same brace damp the gatling
+        // and autocannon both take, so a plasma round is not a silent
+        // exception to "hull mounts kick".
+        let brace = if f.mech_brace { MECH_BRACE_RECOIL_DAMP } else { 1.0 };
+        f.punch_vel[0] += mech_mount_kick(PLASMA_DAMAGE) * kick_mult * brace;
+        f.plasma_shot_i = shot_i + 1;
         true
     }
 
@@ -15235,6 +15318,102 @@ mod tests {
         // anything to recover
         assert!(PLASMA_VENT_S > 0.0 && PLASMA_VENT_S < 4.0);
         assert!(PLASMA_COOL_PER_S > 0.0, "a mount that never cools is an ammo count");
+    }
+
+    /// §owner AGILE SUPPORT MECH: the rapid mount's precise-then-loosening
+    /// curve, and the twin revolving muzzles. Four things proven against
+    /// real fired missiles, not just against the counters that drive
+    /// them: the first `PLASMA_PRECISE_SHOTS` are bit-exact on the aim,
+    /// the shot immediately past that window is measurably off it AND
+    /// kicks harder than the base kick alone, the two precise shots left
+    /// from DIFFERENT muzzle positions, and letting the trigger go and
+    /// pressing again restarts the precise window from zero.
+    #[test]
+    fn the_scout_plasma_cannon_is_precise_then_loosens_and_kicks() {
+        let mut s = range(0x9301);
+        {
+            let f = &mut s.fighters[0];
+            f.armor_set = ArmorSet::ScoutMech;
+            f.hull = SCOUT_HULL;
+            f.mech_weapon = MechWeapon::Plasma;
+            f.stagger_t = 0.0;
+            f.gatling_vent_t = 0.0;
+            f.gatling_heat = 0.0;
+            f.mech_brace = false;
+        }
+        // deliberately off-axis, so ANY perturbation is detectable rather
+        // than hidden by an axis the spread happens not to move
+        let aim = normalize([0.3, 0.1, 1.0]);
+
+        let mut precise_positions = Vec::new();
+        for shot in 0..PLASMA_PRECISE_SHOTS {
+            s.fighters[0].gatling_cd = 0.0; // simulate firing every tick, held
+            assert!(
+                s.try_fire_plasma(0, aim),
+                "the precise window itself must fire, shot {shot}"
+            );
+            let m = s.missiles.last().unwrap();
+            let dir = normalize(m.vel);
+            for k in 0..3 {
+                assert!(
+                    (dir[k] - aim[k]).abs() < 1e-6,
+                    "a precise-window shot must be bit-exact on the aim: shot {shot}, \
+                     axis {k}, got {dir:?} vs {aim:?}"
+                );
+            }
+            precise_positions.push(m.pos);
+        }
+        // the twin muzzles: the two precise shots' DIRECTIONS are
+        // identical (proven above) but their ORIGINS must differ - that
+        // is the whole meaning of "revolving", and a bug that aimed both
+        // barrels from the same point would still pass every assertion
+        // above this one.
+        let sep = ((precise_positions[0][0] - precise_positions[1][0]).powi(2)
+            + (precise_positions[0][2] - precise_positions[1][2]).powi(2))
+        .sqrt();
+        assert!(
+            (sep - 2.0 * PLASMA_CANNON_OFFSET_M).abs() < 1e-4,
+            "the two muzzles must sit exactly PLASMA_CANNON_OFFSET_M apart on \
+             either side of centre, got a separation of {sep}"
+        );
+
+        // one shot past the precise window: real spread, AND real extra kick.
+        s.fighters[0].gatling_cd = 0.0;
+        let punch_before = s.fighters[0].punch_vel[0];
+        assert!(s.try_fire_plasma(0, aim), "the ramped shot must still fire");
+        let m = s.missiles.last().unwrap();
+        let dir = normalize(m.vel);
+        let dev = ((dir[0] - aim[0]).powi(2)
+            + (dir[1] - aim[1]).powi(2)
+            + (dir[2] - aim[2]).powi(2))
+        .sqrt();
+        assert!(
+            dev > 1e-4,
+            "the shot past the precise window must show real spread, deviation was {dev}"
+        );
+        let punch_after = s.fighters[0].punch_vel[0];
+        let base_kick = mech_mount_kick(PLASMA_DAMAGE);
+        assert!(
+            punch_after - punch_before > base_kick,
+            "past the precise window the kick must exceed the unramped base kick \
+             alone: added {}, base was {base_kick}",
+            punch_after - punch_before
+        );
+
+        // release the trigger and press again: the window must restart,
+        // not continue climbing from where it left off.
+        s.fighters[0].gatling_trigger_t = 0.0;
+        s.fighters[0].gatling_cd = 0.0;
+        assert!(s.try_fire_plasma(0, aim), "the reset press must fire");
+        let m = s.missiles.last().unwrap();
+        let dir = normalize(m.vel);
+        for k in 0..3 {
+            assert!(
+                (dir[k] - aim[k]).abs() < 1e-6,
+                "releasing and pressing again must restart the precise window: \
+                 axis {k}, got {dir:?}"
+            );
+        }
     }
 
     /// §owner PLASMA BOW mode 2: the precision shot charges, commits,
