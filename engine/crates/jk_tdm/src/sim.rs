@@ -6834,7 +6834,7 @@ impl TdmSim {
                     f.gatling_vent_t = 0.0;
                     f.gatling_heat = 0.0; // a vent always clears the mount
                 }
-            } else if f.gatling_trigger_t <= 0.0 {
+            } else if f.gatling_trigger_t <= 0.0 && !f.wall_climbing {
                 // §owner AGILE SUPPORT MECH: the cool rate belongs to the
                 // MOUNT, not to the field.
                 //
@@ -6846,6 +6846,15 @@ impl TdmSim {
                 // 0.39/s, so under the gatling's rate its heat was erased
                 // faster than it could ever build and the cannon could
                 // not overheat at all. The test caught exactly that.
+                //
+                // `!f.wall_climbing` is the same idea applied to the
+                // climb: it draws on the identical shared pool
+                // (`WALL_CLIMB_HEAT_PER_S`, a few lines below the cool
+                // rates), and at 0.075/s against a 0.34/s plasma cool
+                // rate, cooling would erase 4.5x what climbing adds
+                // every tick - the pool could never fill from climbing
+                // alone, and the doc comment's "13.3s of continuous
+                // climbing" claim would be fiction.
                 let cool = match f.mech_weapon {
                     MechWeapon::Plasma | MechWeapon::Repair => PLASMA_COOL_PER_S,
                     _ => GATLING_HEAT_DECAY,
@@ -8591,6 +8600,29 @@ impl TdmSim {
         // walking off the edge of the wall you are on stops the climb on
         // its own the very next tick - see `wall_climbing`'s own doc
         // comment.
+        //
+        // Unlike the hull-climb pass above (which re-derives an ABSOLUTE
+        // position from the mount every tick, so anything the integrate
+        // pass does to it later in the same tick is simply overwritten
+        // again next tick, never compounding), this pass is INCREMENTAL:
+        // it adds to the fighter's own previous height. The integrate
+        // loop below unconditionally applies gravity to every fighter
+        // with no support under them, which would claw back
+        // `GRAVITY*DT*DT` of THIS tick's rise before the tick ends - and
+        // because the climb is incremental, that loss compounds every
+        // tick instead of washing out. So the integrate loop explicitly
+        // skips anyone `wall_climbing` (see its own top-of-loop check) -
+        // this pass owns 100% of a climbing fighter's physical state for
+        // the tick, not merely the last write.
+        //
+        // It also pulls the fighter onto the wall's own XZ footprint
+        // (the contact point `wall_climb_target` already computes),
+        // re-snapped every tick same as the height: climbing only ever
+        // changed height until this fix, which left the fighter hanging
+        // in the air up to `WALL_CLIMB_REACH_M` to the side of the wall
+        // - support only registers over the footprint itself, so at the
+        // top they were "level with the wall, beside it" and fell the
+        // whole height the instant the climb ended.
         for i in 0..self.fighters.len() {
             if !self.fighters[i].wall_climbing {
                 continue;
@@ -8607,7 +8639,7 @@ impl TdmSim {
             } else {
                 None
             };
-            let Some(top) = target else {
+            let Some((top, nx, nz)) = target else {
                 let f = &mut self.fighters[i];
                 f.wall_climbing = false;
                 // an exhaustion cutoff still vents the shared pool, same
@@ -8621,7 +8653,9 @@ impl TdmSim {
             };
             let f = &mut self.fighters[i];
             let new_y = (f.pos[1] + WALL_CLIMB_SPEED_MPS * DT).min(top);
+            f.pos[0] = nx;
             f.pos[1] = new_y;
+            f.pos[2] = nz;
             f.vy = 0.0;
             f.vel = [0.0, 0.0]; // both hands on the wall - no lateral drift
             f.gatling_heat = (f.gatling_heat + WALL_CLIMB_HEAT_PER_S * DT).min(1.0);
@@ -8695,6 +8729,16 @@ impl TdmSim {
         // loop holds a mutable borrow of the one it is integrating.
         let mut mech_landings: Vec<usize> = Vec::new();
         for i in 0..self.fighters.len() {
+            // §owner AGILE SUPPORT MECH: the wall-climb pass above already
+            // set this fighter's full physical state (pos, vy, vel,
+            // grounded) for the tick and owns it completely - letting
+            // gravity and the wall push-out logic below run over it too
+            // would claw back part of this tick's rise (see the pass's
+            // own comment) and shove the climber back off the wall face
+            // it was just snapped onto.
+            if self.fighters[i].wall_climbing {
+                continue;
+            }
             // mid-roll: the somersault owns the velocity (player and bots
             // alike — bots roll off hard landings too)
             {
@@ -10521,13 +10565,18 @@ impl TdmSim {
     /// point is within `WALL_CLIMB_REACH_M` of the fighter - and whose
     /// top is still ABOVE the fighter, so a scout standing on top of a
     /// wall it just finished climbing does not re-trigger against the
-    /// same slab. Returns that top's world Y.
+    /// same slab. Returns that top's world Y, together with the nearest
+    /// point on the wall's own footprint (clamped XZ) - the climb pass
+    /// pulls the fighter onto that point every tick, because a climb
+    /// that only ever changes height leaves the fighter hanging in the
+    /// air beside the wall rather than on top of it (support only
+    /// registers over the footprint itself).
     ///
     /// Deliberately cheap and re-run every tick rather than cached - see
     /// `Fighter::wall_climbing`'s own doc comment for why.
-    pub fn wall_climb_target(&self, p: usize) -> Option<f32> {
+    pub fn wall_climb_target(&self, p: usize) -> Option<(f32, f32, f32)> {
         let ppos = self.fighters[p].pos;
-        let mut best: Option<f32> = None;
+        let mut best: Option<(f32, f32, f32)> = None;
         for (aabb, kind) in self.cover.iter().zip(self.cover_kind.iter()) {
             if *kind != CoverKind::Stone {
                 continue;
@@ -10540,8 +10589,8 @@ impl TdmSim {
             let nz = ppos[2].clamp(aabb.min[2], aabb.max[2]);
             let (dx, dz) = (ppos[0] - nx, ppos[2] - nz);
             let dist = (dx * dx + dz * dz).sqrt();
-            if dist < WALL_CLIMB_REACH_M && best.map_or(true, |bt| aabb.max[1] > bt) {
-                best = Some(aabb.max[1]);
+            if dist < WALL_CLIMB_REACH_M && best.map_or(true, |(bt, _, _)| aabb.max[1] > bt) {
+                best = Some((aabb.max[1], nx, nz));
             }
         }
         best
