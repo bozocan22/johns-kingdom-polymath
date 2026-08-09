@@ -15687,13 +15687,23 @@ mod tests {
         // `cmd.shoot` drives in real play (`step`'s own dispatch calls
         // this every tick the button is down, gated by nothing but the
         // held state itself).
-        let mut fired: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        //
+        // `punch_vel` is sampled immediately before and after each
+        // SUCCESSFUL call, inside the same iteration and before the
+        // following `step()` - `step()` decays punch_vel as part of
+        // ordinary recoil recovery, so reading it any later would mix
+        // this shot's real kick with however much of it had already
+        // bled off, and the assertion below would be measuring the
+        // recovery curve as much as the kick itself.
+        let mut fired: Vec<([f32; 3], [f32; 3], f32)> = Vec::new(); // (pos, vel, kick_added)
         for _ in 0..(SIM_HZ as usize * 2) {
             rearm(&mut s); // a live range's other fighter can strip the
                             // hull or stagger the pilot mid-test otherwise
+            let punch_before = s.fighters[0].punch_vel[0];
             if s.try_fire_plasma(0, aim) {
+                let kick_added = s.fighters[0].punch_vel[0] - punch_before;
                 let m = s.missiles.last().unwrap();
-                fired.push((m.pos, m.vel));
+                fired.push((m.pos, m.vel, kick_added));
             }
             s.step(PlayerCmd::default());
             if fired.len() >= 4 {
@@ -15707,8 +15717,13 @@ mod tests {
             fired.len()
         );
 
-        // the first PLASMA_PRECISE_SHOTS must be bit-exact on the aim.
-        for (i, (_, vel)) in fired.iter().take(PLASMA_PRECISE_SHOTS as usize).enumerate() {
+        // the first PLASMA_PRECISE_SHOTS must be bit-exact on the aim,
+        // AND must add exactly the unramped base kick - kick_mult must
+        // read 1.0 in this window, not merely "not yet asserted".
+        let base_kick = mech_mount_kick(PLASMA_DAMAGE);
+        for (i, (_, vel, kick_added)) in
+            fired.iter().take(PLASMA_PRECISE_SHOTS as usize).enumerate()
+        {
             let dir = normalize(*vel);
             for k in 0..3 {
                 assert!(
@@ -15716,6 +15731,11 @@ mod tests {
                     "precise shot {i} must be bit-exact on the aim: axis {k}, got {dir:?}"
                 );
             }
+            assert!(
+                (kick_added - base_kick).abs() < 1e-4,
+                "precise shot {i} must add exactly the unramped base kick: \
+                 added {kick_added}, base {base_kick}"
+            );
         }
         // the twin muzzles: those two precise shots' DIRECTIONS are
         // identical (proven above) but their ORIGINS must differ - that
@@ -15731,11 +15751,12 @@ mod tests {
              apart, got a separation of {sep}"
         );
 
-        // the shot immediately past the window: real spread, and it must
-        // be the FIRST ramped shot, not the second (the off-by-one Thor
-        // caught) - checked by looking at the exact index the constant
-        // names, not merely "some later shot eventually deviates".
-        let (_, ramped_vel) = fired[PLASMA_PRECISE_SHOTS as usize];
+        // the shot immediately past the window: real spread AND real
+        // extra kick, and it must be the FIRST ramped shot, not the
+        // second (the off-by-one Thor caught) - checked by looking at
+        // the exact index the constant names, not merely "some later
+        // shot eventually deviates".
+        let (_, ramped_vel, ramped_kick) = fired[PLASMA_PRECISE_SHOTS as usize];
         let dir = normalize(ramped_vel);
         let dev = ((dir[0] - aim[0]).powi(2)
             + (dir[1] - aim[1]).powi(2)
@@ -15745,6 +15766,11 @@ mod tests {
             dev > 1e-4,
             "the shot immediately past the precise window must show real spread, \
              deviation was {dev}"
+        );
+        assert!(
+            ramped_kick > base_kick,
+            "the shot immediately past the precise window must kick harder than the \
+             unramped base kick: added {ramped_kick}, base {base_kick}"
         );
 
         // releasing the trigger long enough (far past PLASMA_TRIGGER_HOLD_S)
